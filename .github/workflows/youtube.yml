@@ -1,0 +1,46 @@
+name: YouTube feed sync
+
+# Hourly, on the :17 so it isn't competing with everything else that runs
+# on the hour. ~312 quota units a pass, ~7,500 of the 10,000 daily budget,
+# leaving room for a manual --bulk run.
+on:
+  schedule:
+    - cron: '17 * * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'nightly (last 2 days) or bulk (last 12 months)'
+        type: choice
+        options: [nightly, bulk]
+        default: nightly
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    # A pass takes a few minutes; this stops a wedged run from blocking
+    # the next hour's.
+    timeout-minutes: 30
+    concurrency:
+      group: youtube-sync
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install requests psycopg2-binary
+
+      - name: Fetch videos
+        env:
+          YOUTUBE_API_KEY: ${{ secrets.YOUTUBE_API_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: |
+          if [ "${{ inputs.mode }}" = "bulk" ]; then
+            python fetch_youtube_videos.py --bulk
+          else
+            python fetch_youtube_videos.py
+          fi
