@@ -274,62 +274,87 @@ def sync_nba_schedule(conn, seasons=None, mode="full"):
     return saved
 
 def sync_nfl_schedule(conn, seasons=None, mode="full"):
-    # ESPN site scoreboard with date-range - all fields inline, no $ref chasing.
-    # The ESPN core API requires separate fetches for status/scores/teams - avoid for bulk.
+    """
+    ESPN site scoreboard, one day at a time.
+
+    It used to take dates=YYYYMMDD-YYYYMMDD, and no longer does — a range
+    now returns HTTP 400, which the old code logged as "No data". Hence
+    day-by-day: a handful of requests in daily mode, a season's worth on
+    the nightly full pass. Days with no games return an empty events list,
+    which costs one cheap request.
+    """
     if seasons is None: seasons = NFL_SEASONS
     now = datetime.now().strftime("%Y-%m-%d %H:%M:%S"); saved = 0
     abbr_map = {r[1]: (r[0], r[1]) for r in conn.execute(
         "SELECT id,abbreviation FROM teams WHERE league='NFL'")}
+
     for season_year in seasons:
         if season_year not in NFL_SEASON_WINDOWS: continue
         sl = str(season_year); ss, es = NFL_SEASON_WINDOWS[season_year]
         if mode == "daily":
+            # Just enough to catch yesterday's finals and the next few days.
             today = date.today()
-            ss = (today - timedelta(days=7)).strftime("%Y%m%d")
-            es = (today + timedelta(days=21)).strftime("%Y%m%d")
-        log.info("  [NFL] Loading season %s..." % sl)
-        data = get_json(
-            "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
-            "/scoreboard?dates=%s-%s&limit=400" % (ss, es), pause=0.2)
-        if not data: log.info("  [NFL] No data for %s" % sl); continue
+            d0 = today - timedelta(days=2)
+            d1 = today + timedelta(days=8)
+        else:
+            d0 = datetime.strptime(ss, "%Y%m%d").date()
+            d1 = datetime.strptime(es, "%Y%m%d").date()
+            # The window runs into next spring; nothing past today's slate
+            # exists for a season that hasn't started yet, but asking is
+            # harmless and keeps the logic simple.
+        log.info("  [NFL] Loading season %s (%s to %s)..." % (sl, d0, d1))
+
         n_saved = 0
-        for ev in data.get("events", []):
-            gid = "NFL_%s" % ev.get("id", ""); comp = ev.get("competitions", [{}])[0]
-            wk = ev.get("week", {}).get("number")
-            hid = aid = ha = aa = hs = as_ = None
-            for c in comp.get("competitors", []):
-                t = c.get("team", {}); abbr = t.get("abbreviation", "")
-                sc = c.get("score")
-                try: sc = int(sc) if sc is not None else None
-                except: sc = None
-                did, da = abbr_map.get(abbr, (None, abbr))
-                if c.get("homeAway") == "home": hid, ha, hs = did, da, sc
-                else: aid, aa, as_ = did, da, sc
-            venue = comp.get("venue", {}); nets = []
-            for b in comp.get("broadcasts", []):
-                for n in b.get("names", []):
-                    if n not in nets: nets.append(n)
-            st = ev.get("status", {}).get("type", {})
-            if st.get("completed"): status, detail = "Final", st.get("shortDetail", "Final")
-            elif st.get("state") == "in": status, detail = "InProgress", st.get("shortDetail", "")
-            else: status, detail = "Scheduled", st.get("shortDetail", "Scheduled")
-            stype = ev.get("season", {}).get("type", 2)
-            upsert_game(conn, {
-                "league":"NFL", "season":sl, "game_id":gid,
-                "game_date":ev.get("date", "")[:10], "game_time_utc":ev.get("date"),
-                "game_type":"P" if stype == 3 else "R", "week":wk,
-                "home_team_id":hid, "home_team_abbr":ha,
-                "away_team_id":aid, "away_team_abbr":aa,
-                "home_score":hs, "away_score":as_,
-                "game_status":status, "status_detail":detail,
-                "venue_name":venue.get("fullName") if isinstance(venue, dict) else None,
-                "venue_city":venue.get("address", {}).get("city") if isinstance(venue, dict) else None,
-                "venue_state":venue.get("address", {}).get("state") if isinstance(venue, dict) else None,
-                "neutral_site":1 if comp.get("neutralSite") else 0,
-                "broadcasts":json.dumps(nets) if nets else None,
-                "data_source":"ESPN", "last_updated":now}); n_saved += 1
-        conn.commit(); log.info("  [NFL] %s: %d games" % (sl, n_saved)); saved += n_saved
+        cur_day = d0
+        while cur_day <= d1:
+            data = get_json(
+                "https://site.api.espn.com/apis/site/v2/sports/football/nfl"
+                "/scoreboard?dates=%s" % cur_day.strftime("%Y%m%d"), pause=0.1)
+            cur_day += timedelta(days=1)
+            if not data: continue
+            for ev in data.get("events", []):
+                # A season's window overlaps the next one's start; trust the
+                # event's own season rather than the loop we are in.
+                ev_year = str((ev.get("season", {}) or {}).get("year", sl))
+                if ev_year != sl: continue
+                gid = "NFL_%s" % ev.get("id", ""); comp = ev.get("competitions", [{}])[0]
+                wk = ev.get("week", {}).get("number")
+                hid = aid = ha = aa = hs = as_ = None
+                for c in comp.get("competitors", []):
+                    t = c.get("team", {}); abbr = t.get("abbreviation", "")
+                    sc = c.get("score")
+                    try: sc = int(sc) if sc is not None else None
+                    except: sc = None
+                    did, da = abbr_map.get(abbr, (None, abbr))
+                    if c.get("homeAway") == "home": hid, ha, hs = did, da, sc
+                    else: aid, aa, as_ = did, da, sc
+                venue = comp.get("venue", {}); nets = []
+                for b in comp.get("broadcasts", []):
+                    for n in b.get("names", []):
+                        if n not in nets: nets.append(n)
+                st = ev.get("status", {}).get("type", {})
+                if st.get("completed"): status, detail = "Final", st.get("shortDetail", "Final")
+                elif st.get("state") == "in": status, detail = "InProgress", st.get("shortDetail", "")
+                else: status, detail = "Scheduled", st.get("shortDetail", "Scheduled")
+                stype = ev.get("season", {}).get("type", 2)
+                upsert_game(conn, {
+                    "league":"NFL", "season":sl, "game_id":gid,
+                    "game_date":ev.get("date", "")[:10], "game_time_utc":ev.get("date"),
+                    "game_type":"P" if stype == 3 else "R", "week":wk,
+                    "home_team_id":hid, "home_team_abbr":ha,
+                    "away_team_id":aid, "away_team_abbr":aa,
+                    "home_score":hs, "away_score":as_,
+                    "game_status":status, "status_detail":detail,
+                    "venue_name":venue.get("fullName") if isinstance(venue, dict) else None,
+                    "venue_city":venue.get("address", {}).get("city") if isinstance(venue, dict) else None,
+                    "venue_state":venue.get("address", {}).get("state") if isinstance(venue, dict) else None,
+                    "neutral_site":1 if comp.get("neutralSite") else 0,
+                    "broadcasts":json.dumps(nets) if nets else None,
+                    "data_source":"ESPN", "last_updated":now}); n_saved += 1
+            conn.commit()
+        log.info("  [NFL] %s: %d games" % (sl, n_saved)); saved += n_saved
     return saved
+
 
 def sync_mlb_schedule(conn, seasons=None, mode="full"):
     if seasons is None: seasons = MLB_SEASONS
