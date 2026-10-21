@@ -1,0 +1,53 @@
+name: Schedules and scores
+
+# Two cadences, one script:
+#   every 20 minutes  --mode daily  → a narrow window around today, so
+#                                     scores land while games are on
+#   03:40 UTC nightly --mode full   → the whole configured seasons, so the
+#                                     slate and any rescheduling stay right
+on:
+  schedule:
+    - cron: '*/20 * * * *'
+    - cron: '40 3 * * *'
+  workflow_dispatch:
+    inputs:
+      mode:
+        description: 'daily (window around today) or full (whole seasons)'
+        type: choice
+        options: [daily, full]
+        default: daily
+      league:
+        description: 'NHL, NBA, NFL, MLB — blank for all'
+        type: string
+        default: ''
+
+jobs:
+  sync:
+    runs-on: ubuntu-latest
+    timeout-minutes: 40
+    concurrency:
+      group: schedules-sync
+      cancel-in-progress: false
+
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install -r requirements.txt
+
+      - name: Sync schedules
+        env:
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+          # The nightly cron asks for a full pass; everything else is a
+          # narrow one. A manual run uses whatever was chosen above.
+          MODE: ${{ inputs.mode || (github.event.schedule == '40 3 * * *' && 'full' || 'daily') }}
+          LEAGUE: ${{ inputs.league }}
+        run: |
+          ARGS="--mode $MODE"
+          if [ -n "$LEAGUE" ]; then ARGS="$ARGS --league $LEAGUE"; fi
+          echo "Running: refresh_schedules.py $ARGS"
+          python refresh_schedules.py $ARGS
