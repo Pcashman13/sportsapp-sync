@@ -1,19 +1,29 @@
 """
-fetch_youtube_videos.py  (v3)
+fetch_youtube_videos.py  (v4)
 ==============================
 Fetches videos from YouTube channels using the uploads playlist API.
 
 Two modes:
-  --bulk    Fetches up to 200 videos per channel going back 6 months
-             Run once to backfill historical data
+  --bulk    Fetches up to 600 videos per channel going back 12 months
+             Run once to backfill historical data (refreshes everything)
   --nightly Fetches only videos from the last 2 days (default)
-             Run each morning via cron
 
-Quota usage (nightly):
-  ~2 units per channel x 156 channels = ~312 units per run
-  Hourly = ~7,500/day, inside the 10,000 free daily limit.
-Quota usage (bulk):
-  ~10 units per channel x 156 channels = ~1,560 units per run
+Quota (free limit: 10,000 units/day, resets midnight Pacific):
+  playlistItems  1 unit per call  — 1 per channel per run
+  videos         1 unit per call  — only when the channel has a video that
+                                    is new, or not refreshed in 24 hours
+  So a quiet channel costs 1 unit a run and a busy one 2. The real count
+  is printed at the end of every run.
+
+v4 changes:
+  - Videos already saved and refreshed within 24 hours are skipped, so
+    the 2-day window no longer re-fetches the same videos every run.
+    Each video is detailed when first seen and refreshed about once a day
+    while it stays in the window, so view counts still move.
+  - Quota is counted from actual API calls, not estimated.
+  - A channel's sport limits matches to that league only. Before, a sport
+    missing from the list (e.g. EPL) matched players from every league.
+    'ALL' channels match every league, EPL included.
 
 The uploads-playlist lookup that used to cost a unit per channel is gone:
 a channel's uploads playlist id is its channel id with UC swapped for UU.
@@ -67,8 +77,13 @@ log = logging.getLogger(__name__)
 # ─────────────────────────────────────────────────────────────
 # HELPERS
 # ─────────────────────────────────────────────────────────────
+API_CALLS = 0   # every YouTube API call costs 1 unit for the endpoints used
+
+
 def api_get(endpoint, params):
+    global API_CALLS
     params["key"] = YOUTUBE_API_KEY
+    API_CALLS += 1
     try:
         r = requests.get(f"{BASE_URL}/{endpoint}", params=params, timeout=15)
         if r.status_code == 403:
@@ -204,6 +219,20 @@ def get_video_details(video_ids):
     return results
 
 
+def recently_refreshed(c, video_ids):
+    """Video ids already saved and refreshed within the last 24 hours."""
+    if not video_ids:
+        return set()
+    c.execute("""
+        SELECT video_id
+        FROM player_videos
+        WHERE video_id = ANY(%s)
+        GROUP BY video_id
+        HAVING MAX(last_updated) > NOW() - INTERVAL '24 hours'
+    """, (list(video_ids),))
+    return {row[0] for row in c.fetchall()}
+
+
 def build_player_index(conn):
     c = conn.cursor()
     c.execute("""
@@ -226,17 +255,20 @@ def build_player_index(conn):
     return index
 
 
+ALL_LEAGUES = ["MLB", "NHL", "NBA", "NFL", "EPL"]
+
+
 def match_players(title, player_index, sport):
+    """
+    A channel's `sport` must equal the `league` value its players carry in
+    the players table (e.g. EPL channels need EPL players). 'ALL' matches
+    every league.
+    """
     title_lower = title.lower()
-    sport_leagues = {
-        "MLB": ["MLB"], "NHL": ["NHL"],
-        "NBA": ["NBA"], "NFL": ["NFL"],
-        "ALL": ["MLB", "NHL", "NBA", "NFL"],
-    }
-    valid = sport_leagues.get(sport, [])
+    valid = ALL_LEAGUES if sport == "ALL" else [sport]
     matches = []
     for name, player in player_index.items():
-        if valid and player["league"] not in valid:
+        if player["league"] not in valid:
             continue
         if name in title_lower:
             matches.append((player["player_id"], player["full_name"]))
@@ -276,10 +308,10 @@ def main():
         sys.exit(1)
 
     start = datetime.now()
-    mode  = "BULK (6 months)" if BULK_MODE else "NIGHTLY (last 2 days)"
+    mode  = "BULK (12 months)" if BULK_MODE else "NIGHTLY (last 2 days)"
 
     log.info("=" * 55)
-    log.info(f"  YouTube Video Fetch v3 — {start.strftime('%Y-%m-%d %H:%M')}")
+    log.info(f"  YouTube Video Fetch v4 — {start.strftime('%Y-%m-%d %H:%M')}")
     log.info(f"  Mode: {mode}")
     log.info(f"  Cutoff: {CUTOFF_DATE.strftime('%Y-%m-%d')}")
     log.info("=" * 55)
@@ -300,7 +332,7 @@ def main():
 
     player_index = build_player_index(conn)
 
-    total_videos = total_matched = total_saved = quota_used = 0
+    total_videos = total_matched = total_saved = total_skipped = 0
     quota_exceeded = False
     processed = 0
 
@@ -318,25 +350,50 @@ def main():
         # Step 2: Fetch videos with pagination up to MAX_VIDEOS
         videos = (get_videos_from_playlist(playlist_id, MAX_VIDEOS, CUTOFF_DATE)
                   if playlist_id else None)
-        if not videos:
+        if videos == "QUOTA_EXCEEDED":
+            quota_exceeded = True
+            break
+        # An empty result usually just means a quiet channel. The paid
+        # playlist lookup is only worth it when the derived id didn't work
+        # at all, which a bulk run will surface.
+        if not videos and BULK_MODE:
             playlist_id = get_uploads_playlist_id(channel_id)
-            quota_used += 1
             if playlist_id == "QUOTA_EXCEEDED":
                 quota_exceeded = True
                 break
             if playlist_id:
                 videos = get_videos_from_playlist(
                     playlist_id, MAX_VIDEOS, CUTOFF_DATE)
-        quota_used += max(1, len(videos) // 50) if videos and videos != "QUOTA_EXCEEDED" else 1
-        if videos == "QUOTA_EXCEEDED":
-            quota_exceeded = True
-            break
+                if videos == "QUOTA_EXCEEDED":
+                    quota_exceeded = True
+                    break
         if not videos:
             continue
 
-        # Step 3: Get durations and view counts
+        # Step 3: match players from the titles first. The title comes free
+        # with the playlist, and a video that names no player is never
+        # saved — so it should never cost a details call either.
+        matched = []
+        for v in videos:
+            hits = match_players(v["title"], player_index, sport)
+            if hits:
+                v["matches"] = hits
+                matched.append(v)
+        videos = matched
+
+        # Step 4: skip videos refreshed in the last day (nightly only)
+        if videos and not BULK_MODE:
+            fresh = recently_refreshed(c, [v["video_id"] for v in videos])
+            total_skipped += len(fresh)
+            videos = [v for v in videos if v["video_id"] not in fresh]
+
+        if not videos:
+            log.info(f"  [{i+1}/{len(channels)}] {name}: nothing new")
+            processed = i + 1
+            continue
+
+        # Step 5: durations and view counts — matched videos only
         details = get_video_details([v["video_id"] for v in videos])
-        quota_used += max(1, len(videos) // 50)
 
         # Filter by duration
         filtered = []
@@ -351,9 +408,9 @@ def main():
         total_videos += len(filtered)
         channel_matches = 0
 
-        # Step 4: Match players and save
+        # Step 6: save
         for video in filtered:
-            for player_id, player_name in match_players(video["title"], player_index, sport):
+            for player_id, player_name in video["matches"]:
                 saved = upsert_video(c, player_id, video, {
                     "channel_id":   channel_id,
                     "name":         name,
@@ -380,7 +437,8 @@ def main():
     log.info(f"  Videos fetched:     {total_videos}")
     log.info(f"  Player matches:     {total_matched}")
     log.info(f"  DB rows saved:      {total_saved}")
-    log.info(f"  Est. quota used:    ~{quota_used} units")
+    log.info(f"  Skipped (fresh):    {total_skipped}")
+    log.info(f"  Quota used:         {API_CALLS} units")
     if quota_exceeded:
         log.warning("  ⚠ Quota exceeded mid-run")
 
