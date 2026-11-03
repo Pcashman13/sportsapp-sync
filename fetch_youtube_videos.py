@@ -62,6 +62,14 @@ BASE_URL         = "https://www.googleapis.com/youtube/v3"
 
 # Mode settings
 BULK_MODE        = "--bulk" in sys.argv
+
+# --only-file PATH: process only the channel ids listed in that file (one
+# per line). Used to backfill newly added channels without re-fetching
+# every existing one:  python3 fetch_youtube_videos.py --bulk --only-file new_channel_ids.txt
+ONLY_FILE = None
+if "--only-file" in sys.argv:
+    _i = sys.argv.index("--only-file")
+    ONLY_FILE = sys.argv[_i + 1] if _i + 1 < len(sys.argv) else None
 MAX_VIDEOS       = 600 if BULK_MODE else 50
 LOOKBACK_DAYS    = 365 if BULK_MODE else 2  # nightly window; safe to overlap
 CUTOFF_DATE      = datetime.now(timezone.utc) - timedelta(days=LOOKBACK_DAYS)
@@ -328,6 +336,11 @@ def main():
         ORDER BY sport, account_type
     """)
     channels = c.fetchall()
+    if ONLY_FILE:
+        with open(ONLY_FILE, encoding="utf-8") as f:
+            wanted = {line.strip() for line in f if line.strip()}
+        channels = [ch for ch in channels if ch[1] in wanted]
+        log.info(f"  Limited to {ONLY_FILE}: {len(wanted)} ids listed")
     log.info(f"  Channels to process: {len(channels)}")
 
     player_index = build_player_index(conn)
