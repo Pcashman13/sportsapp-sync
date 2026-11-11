@@ -177,6 +177,21 @@ def scores_of(g):
     return home, away
 
 
+def shootout_winner(league, g, status, home, away):
+    """A hockey game can't end tied: a level final score means the shootout
+    decided it, and the shootout goal isn't in either team's goals. Add it
+    back for whoever won. Returns (home, away, decided_by_shootout)."""
+    if league != "NHL" or status != "Final" or home is None or home != away:
+        return home, away, False
+    hr = str(g.get("homeResult", "")).upper()
+    ar = str(g.get("awayResult", "")).upper()
+    if hr == "W" or ar in ("L", "OTL", "SOL"):
+        return home + 1, away, True
+    if ar == "W" or hr in ("L", "OTL", "SOL"):
+        return home, away + 1, True
+    return home, away, False
+
+
 def games_in(body):
     items = body.values() if isinstance(body, dict) else (body or [])
     return [g for g in items if isinstance(g, dict)
@@ -324,6 +339,8 @@ def poll(cur, api, league, lookups):
                 continue
             st = status_of(g)
             hs, as_ = scores_of(g)
+            hs, as_, so = shootout_winner(league, g, st, hs, as_)
+            detail = "Final/SO" if so else detail_of(league, g, st)
             cur.execute("""
                 INSERT INTO public.live_scores (league, game_id, tank01_id,
                     home_team_id, away_team_id, status, home_score, away_score,
@@ -338,7 +355,7 @@ def poll(cur, api, league, lookups):
                     final_at = coalesce(live_scores.final_at, excluded.final_at),
                     updated_at = now()
             """, (league, gid, g["gameID"], hid, aid, st, hs, as_,
-                  detail_of(league, g, st), Json(g), st))
+                  detail, Json(g), st))
             n += 1
     cur.connection.commit()
     return n
