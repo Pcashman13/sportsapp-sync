@@ -1,0 +1,45 @@
+name: Live scores
+
+# Live scores for the app, independent of the Mac (live_scores.py).
+#
+# A run starts every 30 minutes through the sports day, 11am–2:30am Chicago
+# (16:00–08:30 UTC; an hour later in summer clock terms, still covered). Each
+# run polls once a minute for up to 45 minutes; the next run cancels it when
+# it starts, so there's no gap even when GitHub starts a run late (scheduled
+# runs are often 5–15 minutes behind). When no game is on and none starts
+# before the run would end, it stops within a minute.
+#
+# Public repo: Actions minutes are free.
+on:
+  schedule:
+    - cron: '0,30 16-23 * * *'
+    - cron: '0,30 0-8 * * *'
+  workflow_dispatch:
+    inputs:
+      minutes:
+        description: 'How long to poll (minutes)'
+        default: '45'
+
+concurrency:
+  group: live-scores
+  cancel-in-progress: true      # the newest run takes over
+
+jobs:
+  poll:
+    runs-on: ubuntu-latest
+    timeout-minutes: 50
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: '3.12'
+
+      - name: Install dependencies
+        run: pip install psycopg2-binary
+
+      - name: Poll live scores
+        env:
+          TANK01_KEY: ${{ secrets.TANK01_KEY }}
+          SUPABASE_DB_URL: ${{ secrets.SUPABASE_DB_URL }}
+        run: python live_scores.py --minutes "${{ inputs.minutes || '45' }}"
